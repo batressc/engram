@@ -99,13 +99,34 @@ type ImportResult struct {
 
 // Syncer handles exporting and importing memory chunks.
 type Syncer struct {
-	store   *store.Store
-	syncDir string // Path to .engram/ in the project repo
+	store     *store.Store
+	syncDir   string    // Path to .engram/ in the project repo (kept for backward compat)
+	transport Transport // Pluggable I/O backend (filesystem, remote, etc.)
 }
 
-// New creates a Syncer. syncDir is the .engram/ directory in the project.
+// New creates a Syncer with a FileTransport rooted at syncDir.
+// This preserves the original constructor signature for backward compatibility.
 func New(s *store.Store, syncDir string) *Syncer {
-	return &Syncer{store: s, syncDir: syncDir}
+	return &Syncer{
+		store:     s,
+		syncDir:   syncDir,
+		transport: NewFileTransport(syncDir),
+	}
+}
+
+// NewLocal is an alias for New — creates a Syncer backed by the local filesystem.
+// Preferred in call sites where the name makes the intent clearer.
+func NewLocal(s *store.Store, syncDir string) *Syncer {
+	return New(s, syncDir)
+}
+
+// NewWithTransport creates a Syncer with a custom Transport implementation.
+// This is used for remote (cloud) sync where chunks travel over HTTP.
+func NewWithTransport(s *store.Store, transport Transport) *Syncer {
+	return &Syncer{
+		store:     s,
+		transport: transport,
+	}
 }
 
 // ─── Export (DB → chunks) ────────────────────────────────────────────────────
@@ -114,10 +135,14 @@ func New(s *store.Store, syncDir string) *Syncer {
 // It reads the manifest to know what's already exported, then creates
 // a new chunk with only the new data.
 func (sy *Syncer) Export(createdBy string, project string) (*SyncResult, error) {
-	// Ensure directories exist
-	chunksDir := filepath.Join(sy.syncDir, "chunks")
-	if err := os.MkdirAll(chunksDir, 0755); err != nil {
-		return nil, fmt.Errorf("create chunks dir: %w", err)
+	// Pre-flight: ensure the sync directory structure exists for filesystem transports.
+	// This preserves the original error ordering where "create chunks dir" was the
+	// first check in Export, before manifest reading.
+	if sy.syncDir != "" {
+		chunksDir := filepath.Join(sy.syncDir, "chunks")
+		if err := os.MkdirAll(chunksDir, 0755); err != nil {
+			return nil, fmt.Errorf("create chunks dir: %w", err)
+		}
 	}
 
 	// Read current manifest (or create empty one)
@@ -174,13 +199,7 @@ func (sy *Syncer) Export(createdBy string, project string) (*SyncResult, error) 
 		return &SyncResult{IsEmpty: true}, nil
 	}
 
-	// Write compressed chunk
-	chunkPath := filepath.Join(chunksDir, chunkID+".jsonl.gz")
-	if err := writeGzip(chunkPath, chunkJSON); err != nil {
-		return nil, fmt.Errorf("write chunk: %w", err)
-	}
-
-	// Update manifest
+	// Build manifest entry
 	entry := ChunkEntry{
 		ID:        chunkID,
 		CreatedBy: createdBy,
@@ -189,6 +208,13 @@ func (sy *Syncer) Export(createdBy string, project string) (*SyncResult, error) 
 		Memories:  len(chunk.Observations),
 		Prompts:   len(chunk.Prompts),
 	}
+
+	// Write chunk via transport
+	if err := sy.transport.WriteChunk(chunkID, chunkJSON, entry); err != nil {
+		return nil, fmt.Errorf("write chunk: %w", err)
+	}
+
+	// Update manifest
 	manifest.Chunks = append(manifest.Chunks, entry)
 
 	if err := sy.writeManifest(manifest); err != nil {
@@ -228,7 +254,6 @@ func (sy *Syncer) Import() (*ImportResult, error) {
 	}
 
 	result := &ImportResult{}
-	chunksDir := filepath.Join(sy.syncDir, "chunks")
 
 	for _, entry := range manifest.Chunks {
 		// Skip already-imported chunks
@@ -237,9 +262,8 @@ func (sy *Syncer) Import() (*ImportResult, error) {
 			continue
 		}
 
-		// Read and decompress the chunk
-		chunkPath := filepath.Join(chunksDir, entry.ID+".jsonl.gz")
-		chunkJSON, err := readGzip(chunkPath)
+		// Read the chunk via transport
+		chunkJSON, err := sy.transport.ReadChunk(entry.ID)
 		if err != nil {
 			// Chunk file missing — skip (maybe deleted or not yet pulled)
 			result.ChunksSkipped++
@@ -306,29 +330,11 @@ func (sy *Syncer) Status() (localChunks int, remoteChunks int, pendingImport int
 // ─── Manifest I/O ────────────────────────────────────────────────────────────
 
 func (sy *Syncer) readManifest() (*Manifest, error) {
-	path := filepath.Join(sy.syncDir, "manifest.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &Manifest{Version: 1}, nil
-		}
-		return nil, fmt.Errorf("read manifest: %w", err)
-	}
-
-	var m Manifest
-	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("parse manifest: %w", err)
-	}
-	return &m, nil
+	return sy.transport.ReadManifest()
 }
 
 func (sy *Syncer) writeManifest(m *Manifest) error {
-	path := filepath.Join(sy.syncDir, "manifest.json")
-	data, err := jsonMarshalManifest(m, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal manifest: %w", err)
-	}
-	return os.WriteFile(path, data, 0644)
+	return sy.transport.WriteManifest(m)
 }
 
 func (sy *Syncer) lastChunkTime(m *Manifest) string {
